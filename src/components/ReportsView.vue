@@ -32,7 +32,9 @@ const maxDone = computed(() => Math.max(1, ...refereeRows.value.map(r => (r.done
 const coverage = computed(() => store.conflicts?.coverage || { slots_need: 0, slots_filled: 0, slots_pct: 100, roles: {} })
 const roleLabels = { chief: '主裁', assistant: '助理裁判', recorder: '记录台' }
 const recentLogs = computed(() => store.assignmentLogs.slice(0, 6)
-  .map(l => ({ ...l, name: { assign: '排班', force_assign: '强制排班', auto_assign: '自动排班', release: '解除', reassign: '临时调班', swap: '调班对调', match_change: '赛程变更', schedule_added: '赛程新增', schedule_rebuild: '赛程重排', match_finish: '完赛归档', void_release: '取消解除' }[l.action] || l.action })))
+  .map(l => ({ ...l, name: { assign: '排班', force_assign: '强制排班', auto_assign: '自动排班', release: '解除', reassign: '临时调班', swap: '调班对调', match_change: '赛程变更', auto_reassign: '改期自动重排', reschedule_rollback: '冲突回滚', schedule_added: '赛程新增', schedule_rebuild: '赛程重排', match_finish: '完赛归档', void_release: '取消解除' }[l.action] || l.action })))
+// 改期联动：自动重排 / 冲突回滚 / 赛程变更累计
+const reschedule = computed(() => store.conflicts?.reschedule || { auto_reassigned: 0, rollbacks: 0, changes: 0 })
 </script>
 
 <template>
@@ -103,6 +105,9 @@ const recentLogs = computed(() => store.assignmentLogs.slice(0, 6)
             </div>
           </div>
           <div v-if="store.conflicts?.crew_gaps?.length" class="tag o mt16">🟠 {{ store.conflicts.crew_gaps.length }} 场执法名单不齐</div>
+          <div class="row spread mt16" style="margin-bottom:8px"><span class="badge">🕐 改期联动（自动重排 / 冲突回滚）</span>
+            <b class="mono"><span style="color:var(--accent2)">{{ reschedule.auto_reassigned }}</span> 席位重排 · <span :style="{ color: reschedule.rollbacks ? '#e5484d' : 'var(--accent2)' }">{{ reschedule.rollbacks }}</span> 次回滚 · {{ reschedule.changes }} 次变更</b>
+          </div>
           <div class="row spread mt16" style="margin-bottom:8px"><span class="badge">⛔ 未决冲突</span>
             <b :style="{ color: (store.conflicts?.referee_conflicts.length || 0) + (store.conflicts?.venue_conflicts.length || 0) ? '#e5484d' : 'var(--accent2)' }">
               {{ (store.conflicts?.referee_conflicts.length || 0) + (store.conflicts?.venue_conflicts.length || 0) }} 起

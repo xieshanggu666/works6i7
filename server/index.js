@@ -291,38 +291,90 @@ function autoAssign(operator = '组委会') {
   return autoFillCrews(operator)
 }
 
-// 赛程变更：调整场次时间/场地，联动校验该场全部执法安排与场地占用
-function updateMatchSchedule(matchId, { time_label, venue_id, operator, reason, force }) {
+// 赛程变更：调整场次时间/场地，联动执法安排——冲突席位自动重排，无法消解则整体回滚
+// 自动重排：改期后与新时段冲突的执法席位，按智能排班同一口径（专长/资质/无冲突/负荷均衡）自动改派并留痕；
+// 冲突回滚：场地撞场或存在无人可补的席位时，整个变更（含已重排席位）在事务内整体回滚，事务外补写回滚留痕；
+// force=true 强制生效：能重排的席位照常重排，消解不了的冲突保留并在预警中持续标记。
+// 仅待赛场次可改期；完赛/取消场次时间锁定，已归档的执法记录与工作量统计不受改期影响。
+function updateMatchSchedule(matchId, { time_label, venue_id, operator, reason, force, auto_reassign = true }) {
   const m = get('SELECT * FROM matches WHERE id=?', matchId)
   if (!m) throw new Error('场次不存在')
-  if (m.status !== 'scheduled') throw new Error('仅待赛场次可调整赛程（完赛场次时间锁定）')
+  if (m.status !== 'scheduled') throw new Error('仅待赛场次可调整赛程（完赛/取消场次时间已锁定，执法记录已归档）')
   const newTime = time_label == null ? m.time_label : String(time_label).trim()
   let newVenue = venue_id == null ? m.venue_id : Number(venue_id)
   if (newVenue && !get('SELECT id FROM venues WHERE id=?', newVenue)) throw new Error('场地不存在')
+  if ((newTime || null) === (m.time_label || null) && (newVenue || null) === (m.venue_id || null)) {
+    return { ok: true, unchanged: true, reassigned: [], unresolved: [], venue_clash: [] }
+  }
+  const op = operator || '组委会'
+  const why = reason || '赛程调整'
+  const oldVenue = m.venue_id ? get('SELECT name FROM venues WHERE id=?', m.venue_id)?.name : '未指定'
   const venueName = newVenue ? get('SELECT name FROM venues WHERE id=?', newVenue)?.name : null
 
-  // 先应用变更，再基于"变更后"的全局排班状态检测（正确处理多场同时改期等交叉场景）
-  const oldVenue = m.venue_id ? get('SELECT name FROM venues WHERE id=?', m.venue_id)?.name : '未指定'
-  run(`UPDATE matches SET time_label=?, venue_id=? WHERE id=?`, newTime, newVenue || null, matchId)
+  try {
+    // 单事务：变更应用 → 冲突检测 → 自动重排；任一环节不可消解即整体回滚，杜绝"改了一半"的中间态
+    return withTransaction(() => {
+      // 先应用变更，再基于"变更后"的全局排班状态检测（正确处理多场同时改期等交叉场景）
+      run(`UPDATE matches SET time_label=?, venue_id=? WHERE id=?`, newTime, newVenue || null, matchId)
+      const fresh = get('SELECT * FROM matches WHERE id=?', matchId)
 
-  const clashRows = newVenue ? venueClashMatches(newVenue, newTime, matchId) : []
-  const refConflicts = []
-  all(`SELECT a.*, r.name rname FROM assignments a JOIN referees r ON r.id=a.referee_id WHERE a.match_id=? AND a.status='assigned'`, matchId)
-    .forEach(a => refBusyMatches(a.referee_id, newTime, matchId)
-      .forEach(b => refConflicts.push({ referee_id: a.referee_id, referee: a.rname, match_id: b.id, title: matchTitle(b) })))
+      // 场地撞场无法通过改派裁判消解
+      const clashRows = newVenue ? venueClashMatches(newVenue, newTime, matchId) : []
+      // 改期后与新时段冲突的在派执法席位
+      const conflicted = all(`SELECT a.*, r.name rname FROM assignments a JOIN referees r ON r.id=a.referee_id
+                              WHERE a.match_id=? AND a.status='assigned'`, matchId)
+        .map(a => ({ a, busy: refBusyMatches(a.referee_id, newTime, matchId) }))
+        .filter(x => x.busy.length)
 
-  if (!force && (clashRows.length || refConflicts.length)) {
-    // 回滚变更
-    run(`UPDATE matches SET time_label=?, venue_id=? WHERE id=?`, m.time_label, m.venue_id, matchId)
-    const err = new Error('赛程变更将引发场地撞场或裁判时间冲突，请确认后强制生效或先调班')
-    err.code = 'CONFLICT'
-    err.conflicts = { venue: clashRows.map(c => ({ match_id: c.id, title: matchTitle(c) })), referee: refConflicts }
-    throw err
+      const reassigned = [], unresolved = []
+      conflicted.forEach(({ a, busy }) => {
+        const busyList = busy.map(b => ({ match_id: b.id, title: matchTitle(b) }))
+        // 自动重排：按智能排班同一口径为该席位另选裁判（crewRowsOf 实时读取，同场多席位不会重复占位）
+        const pick = auto_reassign === false ? null
+          : pickRefForRole(fresh, a.role, crewRowsOf(matchId).filter(x => x.id !== a.id))
+        if (!pick) {
+          unresolved.push({ referee_id: a.referee_id, referee: a.rname, role: a.role, role_name: ROLE_NAME[a.role], conflicts: busyList })
+          return
+        }
+        run(`UPDATE assignments SET status='released', released_at=datetime('now','localtime') WHERE id=?`, a.id)
+        run(`INSERT INTO assignments (match_id,referee_id,role,status) VALUES (?,?,?,'assigned')`, matchId, pick.id, a.role)
+        addLog('auto_reassign', matchId, pick.id,
+          `${matchTitle(fresh)} 改期至 ${newTime || '未指定'}，${a.rname} 与新时段冲突，自动改派 ${pick.name} 担任${ROLE_NAME[a.role]}`,
+          why, op)
+        reassigned.push({ role: a.role, role_name: ROLE_NAME[a.role], from: a.rname, to: pick.name })
+      })
+
+      if (!force && (clashRows.length || unresolved.length)) {
+        // 冲突回滚：抛错触发事务回滚，赛程变更与已重排席位一并撤销
+        const parts = []
+        if (clashRows.length) parts.push(`场地撞场 ${clashRows.length} 起`)
+        if (unresolved.length) parts.push(`${unresolved.length} 个执法席位冲突且无人可自动改派`)
+        const err = new Error(`赛程变更存在${parts.join('、')}，已整体回滚；可强制生效或先调班`)
+        err.code = 'CONFLICT'
+        err.rolledBack = true
+        err.conflicts = {
+          venue: clashRows.map(c => ({ match_id: c.id, title: matchTitle(c) })),
+          referee: unresolved,
+          reassigned   // 本可自动重排的席位（已随回滚撤销，仅供前端说明）
+        }
+        throw err
+      }
+      addLog('match_change', matchId, null,
+        `${matchTitle(m)}：时间 ${m.time_label || '未指定'} → ${newTime || '未指定'}；场地 ${oldVenue} → ${venueName || '未指定'}` +
+        `${reassigned.length ? `；自动重排 ${reassigned.length} 个执法席位（${reassigned.map(r => `${r.role_name} ${r.from}→${r.to}`).join('，')}）` : ''}` +
+        `${force && (clashRows.length || unresolved.length) ? `；强制生效（残留 ${clashRows.length + unresolved.length} 起冲突已标记）` : ''}`,
+        force ? `${why}（强制）` : why, op)
+      return { ok: true, reassigned, unresolved, venue_clash: clashRows.map(c => ({ match_id: c.id, title: matchTitle(c) })) }
+    })
+  } catch (e) {
+    if (e.rolledBack) {
+      // 回滚留痕：事务已回滚，在事务外补写一条回滚记录（变更本身不留痕，回滚事实留痕）
+      addLog('reschedule_rollback', matchId, null,
+        `${matchTitle(m)} 改期（${m.time_label || '未指定'} → ${newTime || '未指定'}）触发冲突回滚：${e.message}`,
+        why, op)
+    }
+    throw e
   }
-  addLog('match_change', matchId, null,
-    `${matchTitle(m)}：时间 ${m.time_label || '未指定'} → ${newTime || '未指定'}；场地 ${oldVenue} → ${venueName || '未指定'}`,
-    reason || (force ? '强制变更（已存在冲突）' : '赛程调整'), operator || '组委会')
-  return { ok: true }
 }
 
 // 联动：场次完赛 → 执法安排归档
@@ -1312,16 +1364,17 @@ app.post('/api/assignments/:id/reassign', (req, res) => {
     res.status(e.code === 'CONFLICT' || e.code === 'SKILL_MISMATCH' || e.code === 'ROLE_MISMATCH' ? 409 : 400).json({ error: e.message, code: e.code, conflicts: e.conflicts })
   }
 })
-// 赛程变更（时间/场地），联动执法安排
+// 赛程变更（时间/场地），联动执法安排：冲突席位自动重排，不可消解则整体回滚
 app.patch('/api/matches/:id/schedule', (req, res) => {
   try {
     const r = updateMatchSchedule(Number(req.params.id), {
       time_label: req.body.time_label, venue_id: req.body.venue_id,
-      operator: req.body.operator, reason: req.body.reason, force: !!req.body.force
+      operator: req.body.operator, reason: req.body.reason, force: !!req.body.force,
+      auto_reassign: req.body.auto_reassign !== false
     })
     res.json({ ok: true, ...r })
   } catch (e) {
-    res.status(e.code === 'CONFLICT' ? 409 : 400).json({ error: e.message, code: e.code, conflicts: e.conflicts })
+    res.status(e.code === 'CONFLICT' ? 409 : 400).json({ error: e.message, code: e.code, conflicts: e.conflicts, rolled_back: !!e.rolledBack })
   }
 })
 app.get('/api/assignment-logs', (req, res) => {
@@ -1398,6 +1451,12 @@ app.get('/api/conflicts', (_, res) => {
     if (!refSportOk(r, m.sport_id)) skillMismatch.push({ assignment_id: a.id, referee: r.name, referee_sport: r.sport, role: a.role, role_name: ROLE_NAME[a.role], match_id: m.id, title: matchTitle(m) })
     if (!refLevelOk(r, a.role)) roleMismatch.push({ assignment_id: a.id, referee: r.name, level: r.level, role: a.role, role_name: ROLE_NAME[a.role], match_id: m.id, title: matchTitle(m) })
   })
+  // 改期联动统计：自动重排席位数 / 冲突回滚次数 / 赛程变更次数（报表中心覆盖率联动展示）
+  const rs = get(`SELECT
+    COALESCE(SUM(CASE WHEN action='auto_reassign' THEN 1 ELSE 0 END),0) auto_reassigned,
+    COALESCE(SUM(CASE WHEN action='reschedule_rollback' THEN 1 ELSE 0 END),0) rollbacks,
+    COALESCE(SUM(CASE WHEN action='match_change' THEN 1 ELSE 0 END),0) changes
+    FROM assignment_logs`)
   res.json({
     // unassigned 保持原语义：缺主裁的场次（兼容旧视图）
     unassigned,
@@ -1413,6 +1472,7 @@ app.get('/api/conflicts', (_, res) => {
         pct: roleSlots[r2].need ? Math.round(roleSlots[r2].filled / roleSlots[r2].need * 100) : 100
       }]))
     },
+    reschedule: { auto_reassigned: rs.auto_reassigned, rollbacks: rs.rollbacks, changes: rs.changes },
     referee_conflicts: refereeConflicts,
     venue_conflicts: venueConflicts,
     skill_mismatch: skillMismatch,

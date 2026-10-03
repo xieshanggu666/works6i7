@@ -35,13 +35,14 @@ const levelWarn = (mid, rid, role) => {
 const LOG_NAME = {
   assign: '排班', force_assign: '强制排班', auto_assign: '自动排班',
   release: '解除安排', reassign: '临时调班', swap: '调班对调',
-  match_change: '赛程变更', schedule_added: '赛程新增', schedule_rebuild: '赛程重排',
+  match_change: '赛程变更', auto_reassign: '改期自动重排', reschedule_rollback: '冲突回滚',
+  schedule_added: '赛程新增', schedule_rebuild: '赛程重排',
   match_finish: '完赛归档', void_release: '取消解除'
 }
 const LOG_CLS = {
   assign: 'b', force_assign: 'r', auto_assign: 'g', release: 'gray',
-  reassign: 'o', swap: 'o', match_change: 'y', schedule_added: 'b',
-  schedule_rebuild: 'y', match_finish: 'g', void_release: 'r'
+  reassign: 'o', swap: 'o', match_change: 'y', auto_reassign: 'g', reschedule_rollback: 'r',
+  schedule_added: 'b', schedule_rebuild: 'y', match_finish: 'g', void_release: 'r'
 }
 const TIME_PRESETS = ['09:00', '09:20', '09:30', '09:40', '10:00', '10:20', '10:40', '11:00', '11:20', '12:30', '13:00', '14:00', '14:30', '15:30', '16:00']
 
@@ -128,17 +129,23 @@ async function submitReassign() {
   } catch (e) { reDlg.error = e.message }
 }
 
-// 赛程变更（时间 / 场地），联动校验裁判与场地冲突
-const scDlg = reactive({ show: false, mid: 0, time_label: '', venue_id: '', reason: '', error: '', conflicts: null, force: false })
+// 赛程变更（时间 / 场地）：冲突席位自动重排，无法消解则整体回滚（可强制生效）
+const scDlg = reactive({ show: false, mid: 0, time_label: '', venue_id: '', reason: '', error: '', conflicts: null, force: false, autoReassign: true })
 function openSchedule(m) {
   scDlg.show = true; scDlg.mid = m.id; scDlg.time_label = m.time_label || ''; scDlg.venue_id = m.venue_id || ''
-  scDlg.reason = ''; scDlg.error = ''; scDlg.conflicts = null; scDlg.force = false
+  scDlg.reason = ''; scDlg.error = ''; scDlg.conflicts = null; scDlg.force = false; scDlg.autoReassign = true
 }
 async function submitSchedule(force = false) {
   try {
-    await store.changeSchedule(scDlg.mid, { time_label: scDlg.time_label, venue_id: scDlg.venue_id ? Number(scDlg.venue_id) : null, reason: scDlg.reason.trim() || '赛程调整', force })
+    const r = await store.changeSchedule(scDlg.mid, {
+      time_label: scDlg.time_label, venue_id: scDlg.venue_id ? Number(scDlg.venue_id) : null,
+      reason: scDlg.reason.trim() || '赛程调整', force, auto_reassign: scDlg.autoReassign
+    })
     scDlg.show = false
-    flash('赛程已变更，执法安排联动校验完成')
+    const residual = (r.unresolved?.length || 0) + (r.venue_clash?.length || 0)
+    if (residual) flash(`赛程已强制变更，残留 ${residual} 起冲突未消解，请在预警条中跟进调班`, false)
+    else if (r.reassigned?.length) flash(`赛程已变更，自动重排 ${r.reassigned.length} 个执法席位（${r.reassigned.map(x => `${x.role_name} ${x.from}→${x.to}`).join('，')}），全程已留痕`)
+    else flash('赛程已变更，执法安排联动校验完成')
   } catch (e) {
     if (e.status === 409) { scDlg.conflicts = e.conflicts; scDlg.force = true; scDlg.error = e.message }
     else { scDlg.error = e.message }
@@ -461,9 +468,19 @@ const roleMismatchCount = computed(() => store.conflicts?.role_mismatch?.length 
           </label>
         </div>
         <textarea v-model="scDlg.reason" rows="2" class="mt8" placeholder="变更原因（将写入留痕）" style="width:100%"></textarea>
+        <label class="row mt8" style="gap:6px;font-size:12px;color:var(--muted)">
+          <input type="checkbox" v-model="scDlg.autoReassign" />
+          改期后自动重排冲突的执法席位（无人可补时整体回滚）
+        </label>
         <div v-if="scDlg.conflicts" class="conf-box mt8">
           <div v-if="scDlg.conflicts.venue?.length"><b>🏟️ 场地撞场：</b><div v-for="(c,i) in scDlg.conflicts.venue" :key="'v'+i" class="conf-line">⛔ {{ c.title }}</div></div>
-          <div v-if="scDlg.conflicts.referee?.length"><b>🧑‍⚖️ 裁判时间冲突：</b><div v-for="(c,i) in scDlg.conflicts.referee" :key="'r'+i" class="conf-line">⛔ {{ c.referee }} 同时执法 {{ c.title }}</div></div>
+          <div v-if="scDlg.conflicts.referee?.length"><b>🧑‍⚖️ 无法自动改派的执法席位：</b>
+            <div v-for="(c,i) in scDlg.conflicts.referee" :key="'r'+i" class="conf-line">⛔ {{ c.referee }}（{{ c.role_name }}）<template v-if="c.conflicts?.length"> 与 {{ c.conflicts.map(x => x.title).join('；') }} 撞档</template></div>
+          </div>
+          <div v-if="scDlg.conflicts.reassigned?.length" class="conf-line" style="margin-top:6px;color:var(--muted)">
+            ↩️ 另有 {{ scDlg.conflicts.reassigned.length }} 个席位本可自动重排（{{ scDlg.conflicts.reassigned.map(x => `${x.role_name} ${x.from}→${x.to}`).join('，') }}），已随整体回滚撤销
+          </div>
+          <div class="conf-line" style="margin-top:6px;font-weight:700">本次变更未生效（冲突回滚已留痕），可强制生效或先调班后重试。</div>
         </div>
         <div class="row spread mt16">
           <button class="btn ghost sm" @click="scDlg.show = false">取消</button>

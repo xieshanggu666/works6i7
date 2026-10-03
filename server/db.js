@@ -128,7 +128,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_assignment_active
 -- 排班/调班/赛程变更全量留痕
 CREATE TABLE IF NOT EXISTS assignment_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  action TEXT NOT NULL,        -- assign/force_assign/auto_assign/release/reassign/swap/match_change/schedule_added/schedule_rebuild/match_finish/void_release
+  action TEXT NOT NULL,        -- assign/force_assign/auto_assign/release/reassign/swap/match_change/auto_reassign/reschedule_rollback/schedule_added/schedule_rebuild/match_finish/void_release
   match_id INTEGER,
   referee_id INTEGER,
   detail TEXT,                 -- 人类可读快照（场次/裁判/变更前后）
