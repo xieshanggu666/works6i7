@@ -128,7 +128,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_assignment_active
 -- 排班/调班/赛程变更全量留痕
 CREATE TABLE IF NOT EXISTS assignment_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  action TEXT NOT NULL,        -- assign/force_assign/auto_assign/release/reassign/swap/match_change/schedule_added/schedule_rebuild/match_finish/void_release
+  action TEXT NOT NULL,        -- assign/force_assign/auto_assign/release/reassign/swap/match_change/reschedule_rollback/schedule_added/schedule_rebuild/match_finish/void_release
   match_id INTEGER,
   referee_id INTEGER,
   detail TEXT,                 -- 人类可读快照（场次/裁判/变更前后）
@@ -165,7 +165,7 @@ export function get(sql, ...p) { return db.prepare(sql).get(...p) }
 // 这类读-改-写序列在并发下串行化，杜绝两个审核请求同时通过名额检查。
 // 支持嵌套调用：内层直接并入外层事务，由最外层统一提交；任一环节抛错整体回滚。
 let txDepth = 0
-export function withTransaction(fn) {
+export function withTransaction(fn, onError = null) {
   if (txDepth > 0) return fn()
   db.exec('BEGIN IMMEDIATE')
   txDepth++
@@ -175,6 +175,7 @@ export function withTransaction(fn) {
     return result
   } catch (e) {
     try { db.exec('ROLLBACK') } catch { /* 连接已回滚 */ }
+    try { onError?.(e) } catch { /* 回滚后的审计失败不能覆盖原始错误 */ }
     throw e
   } finally {
     txDepth--

@@ -29,10 +29,12 @@ const maxPts = computed(() => Math.max(1, ...unitPoints.value.map(x => x.pts)))
 const refereeRows = computed(() => store.workload)
 const maxDone = computed(() => Math.max(1, ...refereeRows.value.map(r => (r.done || 0) + (r.upcoming || 0))))
 // 整场覆盖率：按执法席位（主裁/助理/记录台）统计
-const coverage = computed(() => store.conflicts?.coverage || { slots_need: 0, slots_filled: 0, slots_pct: 100, roles: {} })
+const coverage = computed(() => store.conflicts?.coverage?.overall || { slots_need: 0, slots_filled: 0, slots_pct: 100, roles: {} })
+const upcomingCoverage = computed(() => store.conflicts?.coverage?.scheduled || { slots_need: 0, slots_filled: 0, slots_pct: 100, roles: {} })
+const finishedCoverage = computed(() => store.conflicts?.coverage?.finished || { slots_need: 0, slots_filled: 0, slots_pct: 100, roles: {} })
 const roleLabels = { chief: '主裁', assistant: '助理裁判', recorder: '记录台' }
 const recentLogs = computed(() => store.assignmentLogs.slice(0, 6)
-  .map(l => ({ ...l, name: { assign: '排班', force_assign: '强制排班', auto_assign: '自动排班', release: '解除', reassign: '临时调班', swap: '调班对调', match_change: '赛程变更', schedule_added: '赛程新增', schedule_rebuild: '赛程重排', match_finish: '完赛归档', void_release: '取消解除' }[l.action] || l.action })))
+  .map(l => ({ ...l, name: { assign: '排班', force_assign: '强制排班', auto_assign: '自动排班', release: '解除', reassign: '临时调班', swap: '调班对调', match_change: '赛程变更', reschedule_rollback: '改期回滚', schedule_added: '赛程新增', schedule_rebuild: '赛程重排', match_finish: '完赛归档', void_release: '取消解除' }[l.action] || l.action })))
 </script>
 
 <template>
@@ -89,13 +91,23 @@ const recentLogs = computed(() => store.assignmentLogs.slice(0, 6)
         </div>
       </div>
       <div class="card">
-        <div class="caption">📡 整场排班覆盖率与最新变更</div>
+        <div class="caption">📡 整场排班覆盖率与最新变更 <span class="hint">已完赛归档 + 待赛排班</span></div>
         <div class="pad">
           <div class="row spread" style="margin-bottom:8px">
             <span class="badge">执法席位覆盖率（主裁/助理/记录台）</span>
             <b class="mono" style="font-size:16px;color:var(--accent)">{{ coverage.slots_filled }}/{{ coverage.slots_need }}（{{ coverage.slots_pct }}%）</b>
           </div>
           <div class="hbar"><i :style="{ width: coverage.slots_pct + '%', background: coverage.slots_pct === 100 ? 'var(--accent2)' : 'var(--accent)' }"></i></div>
+          <div class="grid g2 mt8" style="gap:8px">
+            <div class="role-mini">
+              <div class="row spread"><span class="ph" style="font-size:12px">已完赛归档</span><b class="mono">{{ finishedCoverage.slots_filled }}/{{ finishedCoverage.slots_need }}（{{ finishedCoverage.slots_pct }}%）</b></div>
+              <div class="hbar"><i :style="{ width: finishedCoverage.slots_pct + '%', background: 'var(--accent2)' }"></i></div>
+            </div>
+            <div class="role-mini">
+              <div class="row spread"><span class="ph" style="font-size:12px">待赛排班</span><b class="mono">{{ upcomingCoverage.slots_filled }}/{{ upcomingCoverage.slots_need }}（{{ upcomingCoverage.slots_pct }}%）</b></div>
+              <div class="hbar"><i :style="{ width: upcomingCoverage.slots_pct + '%', background: 'var(--accent3)' }"></i></div>
+            </div>
+          </div>
           <div class="grid g3 mt16" style="gap:10px">
             <div v-for="role in ['chief','assistant','recorder']" :key="role" class="role-mini">
               <div class="row spread"><span class="ph" style="font-size:12px">{{ roleLabels[role] }}</span><b class="mono">{{ coverage.roles[role]?.filled || 0 }}/{{ coverage.roles[role]?.need || 0 }}</b></div>
@@ -104,8 +116,8 @@ const recentLogs = computed(() => store.assignmentLogs.slice(0, 6)
           </div>
           <div v-if="store.conflicts?.crew_gaps?.length" class="tag o mt16">🟠 {{ store.conflicts.crew_gaps.length }} 场执法名单不齐</div>
           <div class="row spread mt16" style="margin-bottom:8px"><span class="badge">⛔ 未决冲突</span>
-            <b :style="{ color: (store.conflicts?.referee_conflicts.length || 0) + (store.conflicts?.venue_conflicts.length || 0) ? '#e5484d' : 'var(--accent2)' }">
-              {{ (store.conflicts?.referee_conflicts.length || 0) + (store.conflicts?.venue_conflicts.length || 0) }} 起
+            <b :style="{ color: (store.conflicts?.referee_conflicts.length || 0) + (store.conflicts?.venue_conflicts?.filter(c => c.operational).length || 0) ? '#e5484d' : 'var(--accent2)' }">
+              {{ (store.conflicts?.referee_conflicts.length || 0) + (store.conflicts?.venue_conflicts?.filter(c => c.operational).length || 0) }} 起
             </b>
           </div>
           <table style="margin-top:6px">

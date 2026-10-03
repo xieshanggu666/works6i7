@@ -23,7 +23,7 @@ const prog = computed(() => tot.value ? Math.round((doneTotal.value / Math.max(1
       <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#ff7a2f,#ffb27e)"></span><span class="ic">🏅</span><b>{{ tot }}</b><em>比赛项目</em></div>
       <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#2f9bff,#79c4ff)"></span><span class="ic">🗓️</span><b>{{ doneTotal }}</b><em>已完赛场次</em></div>
       <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#dd5b5b,#f0a1a1)"></span><span class="ic">⏳</span><b>{{ ov.pendingMatches || 0 }}</b><em>待赛预约</em></div>
-      <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#ffb92b,#ffd98a)"></span><span class="ic">🧑‍⚖️</span><b>{{ ov.crewCoverage ? ov.crewCoverage.filled + '/' + ov.crewCoverage.need : '—' }}</b><em>执法席位已排{{ ov.crewCoverage ? '（' + ov.crewCoverage.pct + '%）' : '' }}</em></div>
+      <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#ffb92b,#ffd98a)"></span><span class="ic">🧑‍⚖️</span><b>{{ ov.crewCoverage ? ov.crewCoverage.slots_filled + '/' + ov.crewCoverage.slots_need : '—' }}</b><em>执法席位覆盖（已完赛+待赛{{ ov.crewCoverage ? '：' + ov.crewCoverage.pct + '%' : '' }}）</em></div>
       <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#22c15e,#7edda4)"></span><span class="ic">⛳</span><b>{{ prog }}%</b><em>整体完成度</em></div>
     </div>
 

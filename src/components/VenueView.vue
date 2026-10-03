@@ -35,12 +35,12 @@ const levelWarn = (mid, rid, role) => {
 const LOG_NAME = {
   assign: '排班', force_assign: '强制排班', auto_assign: '自动排班',
   release: '解除安排', reassign: '临时调班', swap: '调班对调',
-  match_change: '赛程变更', schedule_added: '赛程新增', schedule_rebuild: '赛程重排',
+  match_change: '赛程变更', reschedule_rollback: '改期回滚', schedule_added: '赛程新增', schedule_rebuild: '赛程重排',
   match_finish: '完赛归档', void_release: '取消解除'
 }
 const LOG_CLS = {
   assign: 'b', force_assign: 'r', auto_assign: 'g', release: 'gray',
-  reassign: 'o', swap: 'o', match_change: 'y', schedule_added: 'b',
+  reassign: 'o', swap: 'o', match_change: 'y', reschedule_rollback: 'r', schedule_added: 'b',
   schedule_rebuild: 'y', match_finish: 'g', void_release: 'r'
 }
 const TIME_PRESETS = ['09:00', '09:20', '09:30', '09:40', '10:00', '10:20', '10:40', '11:00', '11:20', '12:30', '13:00', '14:00', '14:30', '15:30', '16:00']
@@ -129,16 +129,29 @@ async function submitReassign() {
 }
 
 // 赛程变更（时间 / 场地），联动校验裁判与场地冲突
-const scDlg = reactive({ show: false, mid: 0, time_label: '', venue_id: '', reason: '', error: '', conflicts: null, force: false })
+const scDlg = reactive({ show: false, mid: 0, status: 'scheduled', time_label: '', venue_id: '', reason: '', error: '', conflicts: null, force: false, auto_rearrange: true })
 function openSchedule(m) {
-  scDlg.show = true; scDlg.mid = m.id; scDlg.time_label = m.time_label || ''; scDlg.venue_id = m.venue_id || ''
-  scDlg.reason = ''; scDlg.error = ''; scDlg.conflicts = null; scDlg.force = false
+  scDlg.show = true; scDlg.mid = m.id; scDlg.status = m.status
+  scDlg.time_label = m.time_label || ''; scDlg.venue_id = m.venue_id || ''
+  scDlg.reason = ''; scDlg.error = ''; scDlg.conflicts = null; scDlg.force = false; scDlg.auto_rearrange = true
 }
 async function submitSchedule(force = false) {
+  if (scDlg.status === 'finished' && !scDlg.reason.trim()) {
+    scDlg.error = '更正已完赛场次的历史赛程必须填写原因'
+    return
+  }
   try {
-    await store.changeSchedule(scDlg.mid, { time_label: scDlg.time_label, venue_id: scDlg.venue_id ? Number(scDlg.venue_id) : null, reason: scDlg.reason.trim() || '赛程调整', force })
+    const r = await store.changeSchedule(scDlg.mid, {
+      time_label: scDlg.time_label,
+      venue_id: scDlg.venue_id ? Number(scDlg.venue_id) : null,
+      reason: scDlg.reason.trim() || (scDlg.status === 'finished' ? '历史赛程更正' : '赛程调整'),
+      force,
+      auto_rearrange: scDlg.auto_rearrange
+    })
     scDlg.show = false
-    flash('赛程已变更，执法安排联动校验完成')
+    if (r.unchanged) flash('赛程未发生变化，无需留痕')
+    else if (r.status === 'finished') flash('已完赛场次历史赛程已更正，执法归档保持不变')
+    else flash(`赛程已保存：自动重排 ${r.rearranged?.length || 0} 席、补齐 ${r.auto_filled?.length || 0} 席`)
   } catch (e) {
     if (e.status === 409) { scDlg.conflicts = e.conflicts; scDlg.force = true; scDlg.error = e.message }
     else { scDlg.error = e.message }
@@ -147,13 +160,22 @@ async function submitSchedule(force = false) {
 
 /* ---------- 场地协同 ---------- */
 const venueRows = computed(() => store.venues.map(v => {
-  const ms = store.matches.filter(m => m.venue_id === v.id && m.status === 'scheduled')
+  const ms = store.matches.filter(m => m.venue_id === v.id && ['scheduled', 'finished'].includes(m.status))
+  const upcoming = ms.filter(m => m.status === 'scheduled')
   const slots = {}
   ms.forEach(m => { (slots[m.time_label] = slots[m.time_label] || []).push(m) })
   const clashSlots = Object.entries(slots).filter(([, list]) => list.length > 1)
-  return { ...v, total: ms.length, clashCount: clashSlots.reduce((n, [, l]) => n + l.length, 0), slots }
+  const operational = clashSlots.filter(([, list]) => list.some(m => m.status === 'scheduled'))
+  const historical = clashSlots.filter(([, list]) => list.every(m => m.status === 'finished'))
+  return {
+    ...v, total: ms.length, upcoming: upcoming.length, finished: ms.length - upcoming.length,
+    clashCount: operational.reduce((n, [, l]) => n + l.length, 0),
+    historicalClashCount: historical.reduce((n, [, l]) => n + l.length, 0),
+    slots
+  }
 }))
-const clashList = computed(() => store.conflicts?.venue_conflicts || [])
+const clashList = computed(() => (store.conflicts?.venue_conflicts || []).filter(c => c.operational))
+const historicalClashList = computed(() => store.conflicts?.historical_venue_conflicts || [])
 
 /* ---------- 裁判名册 ---------- */
 const newRef = reactive({ name: '', sport: '', level: '主裁' })
@@ -171,7 +193,7 @@ const refSkillIds = computed(() => new Set((store.conflicts?.skill_mismatch || [
   const a = store.assignments.find(x => x.id === c.assignment_id); return a?.referee_id
 }).filter(Boolean)))
 
-const conflictCount = computed(() => (store.conflicts?.referee_conflicts.length || 0) + (store.conflicts?.venue_conflicts.length || 0))
+const conflictCount = computed(() => (store.conflicts?.referee_conflicts.length || 0) + clashList.value.length)
 const coverage = computed(() => store.conflicts?.coverage || { slots_need: 0, slots_filled: 0, slots_pct: 100, match_total: 0, match_covered: 0, roles: {} })
 const crewGapCount = computed(() => store.conflicts?.crew_gaps?.length || 0)
 const roleMismatchCount = computed(() => store.conflicts?.role_mismatch?.length || 0)
@@ -195,7 +217,8 @@ const roleMismatchCount = computed(() => store.conflicts?.role_mismatch?.length 
     <div v-if="store.conflicts && (crewGapCount || conflictCount || store.conflicts.skill_mismatch.length || roleMismatchCount)" class="warnbar">
       <span v-if="crewGapCount" class="warn-item o">🟠 {{ crewGapCount }} 场待赛执法名单不齐（{{ coverage.slots_need - coverage.slots_filled }} 个席位空缺）</span>
       <span v-if="store.conflicts.referee_conflicts.length" class="warn-item r">⛔ {{ store.conflicts.referee_conflicts.length }} 起裁判时间冲突</span>
-      <span v-if="store.conflicts.venue_conflicts.length" class="warn-item r">🏟️ {{ store.conflicts.venue_conflicts.length }} 起场地同时段撞场</span>
+      <span v-if="clashList.length" class="warn-item r">🏟️ {{ clashList.length }} 起待赛场地撞场</span>
+      <span v-if="historicalClashList.length" class="warn-item y">🏟️ {{ historicalClashList.length }} 起历史归档场地重叠</span>
       <span v-if="store.conflicts.skill_mismatch.length" class="warn-item y">⚠️ {{ store.conflicts.skill_mismatch.length }} 条跨专长执法</span>
       <span v-if="roleMismatchCount" class="warn-item y">🎖️ {{ roleMismatchCount }} 条跨等级执法</span>
     </div>
@@ -297,7 +320,7 @@ const roleMismatchCount = computed(() => store.conflicts?.role_mismatch?.length 
           <span class="bar" :style="{ background: v.clashCount ? 'linear-gradient(90deg,#e5484d,#f0a1a1)' : 'linear-gradient(90deg, var(--accent3), #7cc4ff)' }"></span>
           <span class="ic">🏟️</span>
           <b>{{ v.name }}</b>
-          <em>待赛 {{ v.total }} 场 · <span :style="{ color: v.clashCount ? '#e5484d' : 'inherit', fontWeight: v.clashCount ? 800 : 400 }">{{ clashText(v.clashCount) }}</span></em>
+          <em>待赛 {{ v.upcoming }} 场 · 已归档 {{ v.finished }} 场 · <span :style="{ color: v.clashCount ? '#e5484d' : 'inherit', fontWeight: v.clashCount ? 800 : 400 }">{{ clashText(v.clashCount) }}</span><span v-if="v.historicalClashCount" class="tag y" style="margin-left:6px">历史重叠 {{ v.historicalClashCount }}</span></em>
         </div>
       </div>
 
@@ -306,15 +329,16 @@ const roleMismatchCount = computed(() => store.conflicts?.role_mismatch?.length 
         <div class="pad" style="display:flex;flex-direction:column;gap:16px">
           <div v-for="v in venueRows" :key="'t' + v.id">
             <div class="sport-cap">📍 {{ v.name }}</div>
-            <div v-if="!v.total" class="empty" style="padding:14px">暂无待赛占用</div>
-            <div v-for="(list, t) in v.slots" :key="t" class="slot-row" :class="{ hot: list.length > 1 }">
+            <div v-if="!v.total" class="empty" style="padding:14px">暂无待赛或归档占用</div>
+            <div v-for="(list, t) in v.slots" :key="t" class="slot-row" :class="{ hot: list.length > 1 && list.some(x => x.status === 'scheduled'), archive: list.length > 1 && list.every(x => x.status === 'finished') }">
               <span class="slot-time mono">{{ t }}</span>
               <span v-for="m in list" :key="m.id" class="slot-match">
                 <b>{{ store.sports.find(s => s.id === m.sport_id)?.name }}</b> · {{ m.stage }}{{ m.group_name || '' }}
                 {{ m.teamA?.name }} VS {{ m.teamB?.name }}
-                <span class="tag gray">🧑‍⚖️{{ store.crewOf(m.id).filter(a => a.role === 'chief').map(a => a.referee?.name).join('、') || '主裁待派' }}</span>
-                <span class="tag" :class="crewGap(m).assistant || crewGap(m).recorder ? 'o' : 'gray'">👥 助理/记录台 {{ store.crewOf(m.id).filter(a => a.role !== 'chief').length }}/{{ crewSpecOf(m).assistant + crewSpecOf(m).recorder }}</span>
-                <button class="mini" @click="tab = 'board'">去处理</button>
+                <span class="tag" :class="m.status === 'finished' ? 'g' : 'b'">{{ m.status === 'finished' ? '已归档' : '待赛' }}</span>
+                <span v-if="crewSpecOf(m).chief" class="tag gray">🧑‍⚖️{{ store.crewOf(m.id).filter(a => a.role === 'chief').map(a => a.referee?.name).join('、') || '主裁待派' }}</span>
+                <span v-if="m.status === 'scheduled' && crewSpecOf(m).chief" class="tag" :class="crewGap(m).assistant || crewGap(m).recorder ? 'o' : 'gray'">👥 助理/记录台 {{ store.crewOf(m.id).filter(a => a.role !== 'chief').length }}/{{ crewSpecOf(m).assistant + crewSpecOf(m).recorder }}</span>
+                <button class="mini" @click="m.status === 'scheduled' ? tab = 'board' : openSchedule(m)">{{ m.status === 'finished' ? '更正记录' : '去处理' }}</button>
               </span>
             </div>
           </div>
@@ -330,6 +354,22 @@ const roleMismatchCount = computed(() => store.conflicts?.role_mismatch?.length 
               <tr v-for="c in clashList" :key="c.key">
                 <td><b>{{ c.venue }}</b></td><td class="mono">{{ c.time }}</td>
                 <td>{{ c.match_x.title }}</td><td class="ph">⚡</td><td>{{ c.match_y.title }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div v-if="historicalClashList.length" class="card mt">
+        <div class="caption"><span>📦 历史归档场地重叠</span><span class="hint">仅用于档案核对；可更正其中一场历史时间/场地并留痕</span></div>
+        <div class="pad">
+          <table>
+            <thead><tr><th>场地</th><th>时段</th><th>场次 A</th><th></th><th>场次 B</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr v-for="c in historicalClashList" :key="c.key">
+                <td><b>{{ c.venue }}</b></td><td class="mono">{{ c.time }}</td>
+                <td>{{ c.match_x.title }}（{{ c.match_x.status === 'finished' ? '已完赛' : '待赛' }}）</td>
+                <td class="ph">⚡</td><td>{{ c.match_y.title }}（{{ c.match_y.status === 'finished' ? '已完赛' : '待赛' }}）</td>
+                <td><button class="mini" @click="openSchedule(store.matches.find(m => m.id === c.match_x.match_id))">更正</button></td>
               </tr>
             </tbody>
           </table>
@@ -447,7 +487,10 @@ const roleMismatchCount = computed(() => store.conflicts?.role_mismatch?.length 
     <!-- 赛程变更弹窗 -->
     <div v-if="scDlg.show" class="modal-mask" @click.self="scDlg.show = false">
       <div class="modal">
-        <h3>🕐 调整赛程时间 / 场地</h3>
+        <h3>{{ scDlg.status === 'finished' ? '📦 更正已完赛场次历史赛程' : '🕐 调整赛程时间 / 场地' }}</h3>
+        <div v-if="scDlg.status === 'finished'" class="conf-box y">
+          已完赛场次仅更正时间/场地档案；执法名单、比分与积分作为历史记录，不会自动重排。
+        </div>
         <div class="row wrap mt8" style="gap:12px">
           <label>开赛时间
             <input v-model="scDlg.time_label" list="time-presets" placeholder="如 10:00" style="width:130px;margin-left:6px" />
@@ -460,15 +503,19 @@ const roleMismatchCount = computed(() => store.conflicts?.role_mismatch?.length 
             </select>
           </label>
         </div>
-        <textarea v-model="scDlg.reason" rows="2" class="mt8" placeholder="变更原因（将写入留痕）" style="width:100%"></textarea>
+        <label v-if="scDlg.status === 'scheduled'" class="row mt8">
+          <input type="checkbox" v-model="scDlg.auto_rearrange" />
+          改期后自动重排冲突裁判并补齐本场执法席位；无法自动解决时整单回滚
+        </label>
+        <textarea v-model="scDlg.reason" rows="2" class="mt8" :placeholder="scDlg.status === 'finished' ? '历史赛程更正原因（必填，将写入留痕）' : '变更原因（将写入留痕）'" style="width:100%"></textarea>
         <div v-if="scDlg.conflicts" class="conf-box mt8">
-          <div v-if="scDlg.conflicts.venue?.length"><b>🏟️ 场地撞场：</b><div v-for="(c,i) in scDlg.conflicts.venue" :key="'v'+i" class="conf-line">⛔ {{ c.title }}</div></div>
+          <div v-if="scDlg.conflicts.venue?.length"><b>🏟️ 场地撞场：</b><div v-for="(c,i) in scDlg.conflicts.venue" :key="'v'+i" class="conf-line">⛔ {{ c.title }}（{{ c.status === 'finished' ? '已完赛归档' : '待赛' }}）</div></div>
           <div v-if="scDlg.conflicts.referee?.length"><b>🧑‍⚖️ 裁判时间冲突：</b><div v-for="(c,i) in scDlg.conflicts.referee" :key="'r'+i" class="conf-line">⛔ {{ c.referee }} 同时执法 {{ c.title }}</div></div>
         </div>
         <div class="row spread mt16">
           <button class="btn ghost sm" @click="scDlg.show = false">取消</button>
           <div class="row">
-            <button v-if="scDlg.conflicts" class="btn ghost sm" @click="submitSchedule(true)">强制生效并留痕</button>
+            <button v-if="scDlg.conflicts" class="btn ghost sm" @click="submitSchedule(true)">强制保留冲突并留痕</button>
             <button class="btn primary sm" @click="submitSchedule(false)">保存变更</button>
           </div>
         </div>
@@ -505,6 +552,7 @@ const roleMismatchCount = computed(() => store.conflicts?.role_mismatch?.length 
 .mini.danger:hover { border-color: #e5484d; color: #e5484d; }
 .slot-row { display: flex; gap: 10px; align-items: flex-start; padding: 9px 12px; border-radius: 10px; background: #fbfcfe; border: 1px dashed var(--line); margin-bottom: 7px; flex-wrap: wrap; }
 .slot-row.hot { background: #fff5f5; border-color: #f0a1a1; }
+.slot-row.archive { background: #fff8e8; border-color: #f0d68a; }
 .slot-time { font-weight: 800; min-width: 52px; color: var(--accent3); }
 .slot-match { font-size: 12px; display: inline-flex; align-items: center; gap: 6px; background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 5px 9px; }
 .hint { font-size: 12px; color: var(--muted); font-weight: 500; margin-right: 10px; }
